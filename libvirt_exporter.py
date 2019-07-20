@@ -14,6 +14,7 @@ parser.add_argument('-uri','--uniform_resource_identifier', help='Libvirt Unifor
 args = vars(parser.parse_args())
 uri = args["uniform_resource_identifier"]
 
+last_values = {}
 
 def connect_to_uri(uri):
     conn = libvirt.open(uri)
@@ -33,7 +34,7 @@ def get_domains(conn):
         dom = conn.lookupByID(id)
 
         if dom == None:
-            print('Failed to find the domain ' + dom.name(), file=sys.stderr)
+            print('Failed to find the domain ' + dom.UUIDString(), file=sys.stderr)
         else:
             domains.append(dom)
 
@@ -42,6 +43,17 @@ def get_domains(conn):
         return None
     else:
         return domains
+
+
+def get_labels(dom):
+    tree = ElementTree.fromstring(dom.XMLDesc())
+
+    ns = {'nova': 'http://openstack.org/xmlns/libvirt/nova/1.0'}
+
+    instance_name = tree.find('metadata').find('nova:instance', ns).find('nova:name', ns).text
+
+    labels = {'domain':dom.UUIDString() + '_' + instance_name}
+    return labels
 
 
 def get_metrics_collections(metric_names, labels, stats):
@@ -71,11 +83,12 @@ def get_metrics_multidim_collections(dom, metric_names, device):
     for mn in metric_names:
         dimensions = []
         for target in targets:
-            labels = {'domain': dom.name()}
-            labels['target_device'] = target
+            labels = get_labels(dom)
             if device == "interface":
+                labels['target_interface'] = target
                 stats = dom.interfaceStats(target) # !
             elif device == "disk":
+                labels['target_disk'] = target
                 stats= dom.blockStats(target)
             stats = dict(zip(metric_names, stats))
             dimension = [stats[mn], labels]
@@ -86,16 +99,67 @@ def get_metrics_multidim_collections(dom, metric_names, device):
     return metrics_collection
 
 
+def custom_derivative(new, time_delta=True, interval=15,
+                      allow_negative=False, instance=None):
+    """
+    Calculate the derivative of the metric.
+    """
+    # Format Metric Path
+    path = instance
+
+    if path in last_values:
+        old = last_values[path]
+        # Check for rollover
+        if new < old:
+            # old = old - max_value
+            # Store Old Value
+            last_values[path] = new
+            # Return 0 if instance was rebooted
+            return 0
+        # Get Change in X (value)
+        derivative_x = new - old
+
+        # If we pass in a interval, use it rather then the configured one
+        if interval is None:
+            interval = float(interval)
+
+        # Get Change in Y (time)
+        if time_delta:
+            derivative_y = interval
+        else:
+            derivative_y = 1
+
+        result = float(derivative_x) / float(derivative_y)
+        if result < 0 and not allow_negative:
+            result = 0
+    else:
+        result = 0
+
+    # Store Old Value
+    last_values[path] = new
+
+    # Return result
+    return result
+
 def add_metrics(dom, header_mn, g_dict):
 
-    labels = {'domain':dom.name()}
+    labels = get_labels(dom)
 
     if header_mn == "libvirt_cpu_stats_":
 
-        stats = dom.getCPUStats(True)
-        metric_names = stats[0].keys()
+        vcpus = dom.getCPUStats(True, 0)
+        totalcpu = 0
+        for vcpu in vcpus:
+            cputime = vcpu['cpu_time']
+            totalcpu += cputime
+
+        value = float(totalcpu / len(dom.vcpus()[0])) / 10000000.0
+        cpu_percent = custom_derivative(new=value, instance=dom.UUIDString())
+        # metric_names = stats[0].keys()
+        stats = [{'cpu_used': cpu_percent}]
+        metric_names = ['cpu_used']
         metrics_collection = get_metrics_collections(metric_names, labels, stats)
-        unit = "_nanosecs"
+        unit = "_percent"
 
     elif header_mn == "libvirt_mem_stats_":
         stats = dom.memoryStats()
@@ -163,7 +227,7 @@ def job(uri, g_dict, scheduler):
 
     for dom in domains:
 
-        print(dom.name())
+        print(dom.UUIDString())
 
         headers_mn = ["libvirt_cpu_stats_", "libvirt_mem_stats_", \
                       "libvirt_block_stats_", "libvirt_interface_"]
